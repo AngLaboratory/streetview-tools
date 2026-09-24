@@ -1,11 +1,11 @@
-from pathlib import Path
-
 import requests
 
 from ._downloader import (
     download_tiles_image,
-    equirect_to_face,
-    adjust_face_angle,
+    equirect_to_perspective,
+    resolve_output_size,
+    select_visible_tiles,
+    adjust_pano_angle,
     save_image,
     save_pano_info_json,
     normalize_size,
@@ -15,7 +15,6 @@ from ._geometry import add_spot_info
 from ._http import REQUEST_HEADERS
 
 _CACHE = {}
-_FACE_DIRECTIONS = "lfrbdu"
 
 
 def get_pano_info(panoid, *, spot=False):
@@ -39,6 +38,7 @@ def get_pano_info(panoid, *, spot=False):
     response.raise_for_status()
     data = response.json()["street_view"]["street"]
     panorama = {
+        "service": "kakao",
         "id": data["id"], "date": data["shot_date"],
         "lon": float(data["wgsx"]), "lat": float(data["wgsy"]),
         "angle": float(data["angle"]), "addr1": data["addr"],
@@ -106,59 +106,45 @@ def save_img(
     return output_path
 
 
-def get_img_face(panoid, direction, *, width=None):
-    """Return Kakao panorama direction faces as PIL images.
+def get_img_face(panoid, *, yaw=0.0, pitch=0.0, width=None, height=None):
+    """Return a perspective view of a Kakao Roadview panorama as a PIL image.
 
-    ``direction`` may be one direction or a sequence of ``l``, ``f``, ``r``,
-    ``b``, ``d``, and ``u``. ``width`` controls the final square face size.
+    ``yaw`` is the left/right viewing angle in degrees (0 = forward, positive
+    = right) and ``pitch`` is the up/down viewing angle in degrees (positive
+    = up). ``width``/``height`` control the output size; the field of view is
+    derived from them automatically instead of being given directly: with
+    both omitted, the panorama's default face size (1024x1024) is used; with
+    only ``width``, a ``width``x``width`` square is returned; with both, the
+    horizontal field of view stays fixed and the vertical field of view
+    expands to fit the requested aspect ratio.
     """
     panoid = str(panoid).strip()
-    directions = [direction] if isinstance(direction, str) else list(direction)
-    directions = [str(item).lower().strip() for item in directions]
-    if not directions or any(item not in _FACE_DIRECTIONS for item in directions):
-        raise ValueError("direction must contain only: l, f, r, b, d, u")
-    panorama_width, panorama_height = 4096, 2048
-    face_size = panorama_width // 4
     image_path = get_pano_info(panoid)["others"]["img_path"]
 
+    rows, cols, tile_size = 4, 8, 512
+    width, height = resolve_output_size(width, height, rows * tile_size)
+    needed = select_visible_tiles(rows, cols, yaw, pitch, width, height)
+
     tiles = [
-        {"x": x * 512, "y": y * 512,
-         "src": _tile_url(image_path, tile_number)}
-        for tile_number, (y, x) in enumerate(
-            ((y, x) for y in range(4) for x in range(8)), 1
-        )
+        {"x": col * tile_size, "y": row * tile_size,
+         "src": _tile_url(image_path, row * cols + col + 1)}
+        for row in range(rows) for col in range(cols)
+        if (row, col) in needed
     ]
 
-    panorama_image = download_tiles_image(tiles)
-    images = [
-        equirect_to_face(panorama_image, item, face_size=face_size)
-        for item in directions
-    ]
-    if width is not None:
-        images = [image.resize((width, width)) for image in images]
-    return images
+    panorama_image = download_tiles_image(
+        tiles, canvas_size=(cols * tile_size, rows * tile_size)
+    )
+    return equirect_to_perspective(panorama_image, yaw, pitch, width=width, height=height)
 
 
-def save_img_face(panoid, direction, *, file_name=None, width=None, save_json=False):
-    """Download and save Kakao panorama face PNG files."""
-    directions = [direction] if isinstance(direction, str) else list(direction)
-    directions = [str(item).lower().strip() for item in directions]
-    images = get_img_face(panoid, directions, width=width)
-    pano_info = get_pano_info(panoid) if save_json else None
-    output_paths = []
-    for item, image in zip(directions, images):
-        if file_name and len(directions) == 1:
-            output_name = file_name
-        elif file_name:
-            path = Path(file_name)
-            output_name = path.with_name(f"{path.stem}_{item}{path.suffix or '.png'}")
-        else:
-            output_name = f"{panoid}_{item}.png"
-        output_path = save_image(image, output_name)
-        if pano_info is not None:
-            save_pano_info_json(adjust_face_angle(pano_info, item), output_path)
-        output_paths.append(output_path)
-    return output_paths
+def save_img_face(panoid, *, yaw=0.0, pitch=0.0, file_name=None, width=None, height=None, save_json=False):
+    """Download and save a Kakao Roadview perspective view PNG."""
+    image = get_img_face(panoid, yaw=yaw, pitch=pitch, width=width, height=height)
+    output_path = save_image(image, file_name or f"{panoid}.png")
+    if save_json:
+        save_pano_info_json(adjust_pano_angle(get_pano_info(panoid), yaw), output_path)
+    return output_path
 
 
 def _tile_url(image_path, tile_number):

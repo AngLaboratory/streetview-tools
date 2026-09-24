@@ -1,11 +1,14 @@
-from pathlib import Path
-
 import requests
+from PIL import Image
 
 from ._downloader import (
     download_tiles_image,
-    equirect_to_face,
-    adjust_face_angle,
+    equirect_to_perspective,
+    cubemap_to_equirect,
+    resolve_output_size,
+    select_visible_tiles,
+    select_visible_faces,
+    adjust_pano_angle,
     save_image,
     save_pano_info_json,
     normalize_size,
@@ -38,6 +41,7 @@ def get_pano_info(panoid, *, spot=False):
     response.raise_for_status()
     data = response.json()
     panorama = {
+        "service": "naver",
         "id": data["id"], "date": data["info"]["photodate"],
         "lon": float(data["longitude"]), "lat": float(data["latitude"]),
         "angle": float(data["camera_angle"][1]),
@@ -127,88 +131,86 @@ def save_img(
 
 def get_img_face(
     panoid,
-    direction,
     *,
+    yaw=0.0,
+    pitch=0.0,
     proj_type="cubic",
     width=None,
+    height=None,
 ):
-    """Return Naver panorama direction faces as PIL images.
+    """Return a perspective view of a Naver panorama as a PIL image.
 
-    ``direction`` must be one of ``l``, ``f``, ``r``, ``b``, ``d``, or ``u``.
-    Cubic panoramas use their direction-specific tiles; equirectangular
-    panoramas are converted to a cubemap face with the common converter.
+    ``yaw`` is the left/right viewing angle in degrees (0 = forward, positive
+    = right) and ``pitch`` is the up/down viewing angle in degrees (positive
+    = up). ``width``/``height`` control the output size; the field of view is
+    derived from them automatically instead of being given directly: with
+    both omitted, the panorama's default size (1024x1024) is used; with only
+    ``width``, a ``width``x``width`` square is returned; with both, the
+    horizontal field of view stays fixed and the vertical field of view
+    expands to fit the requested aspect ratio. Cubic panoramas are stitched
+    from their six direction tiles into an equirectangular image first;
+    equirectangular panoramas are used directly.
     """
     panoid = str(panoid).strip()
-    directions = [direction] if isinstance(direction, str) else list(direction)
-    directions = [str(item).lower().strip() for item in directions]
-    if not directions or any(item not in "lfrbdu" for item in directions):
-        raise ValueError("direction must contain only: l, f, r, b, d, u")
 
     if proj_type == "equirect":
         pano_info = get_pano_info(panoid)
         if pano_info["others"]["proj_type"] != "equirect":
             raise ValueError("This panorama does not support equirect projection")
         zoom = select_zoom(width, {level: 512 * 2 ** level for level in range(4)}, 2)
-        tiles = (
-            [{"x": 0, "y": 0, "src": _equirect_url(panoid, zoom, None, None)}]
-            if zoom == 0
-            else [
-                {"x": x * 512, "y": y * 512,
-                 "src": _equirect_url(panoid, zoom, x, y)}
-                for y in range(2 ** zoom)
-                for x in range(2 ** (zoom + 1))
+        if zoom == 0:
+            panorama = download_tiles_image(
+                [{"x": 0, "y": 0, "src": _equirect_url(panoid, zoom, None, None)}]
+            )
+            width, height = resolve_output_size(width, height, panorama.height)
+        else:
+            rows, cols = 2 ** zoom, 2 ** (zoom + 1)
+            width, height = resolve_output_size(width, height, rows * 512)
+            needed = select_visible_tiles(rows, cols, yaw, pitch, width, height)
+            tiles = [
+                {"x": x * 512, "y": y * 512, "src": _equirect_url(panoid, zoom, x, y)}
+                for y in range(rows) for x in range(cols)
+                if (y, x) in needed
             ]
-        )
-        panorama = download_tiles_image(tiles)
-        images = [
-            equirect_to_face(panorama, item, face_size=panorama.height // 2)
-            for item in directions
-        ]
-        if width is not None:
-            images = [image.resize((width, width)) for image in images]
-        return images
+            panorama = download_tiles_image(tiles, canvas_size=(cols * 512, rows * 512))
+    else:
+        zoom = 1
+        face_size = 1024
+        width, height = resolve_output_size(width, height, face_size * 2)
+        needed_faces = select_visible_faces(yaw, pitch, width, height)
+        faces = {}
+        for letter in "lfrbdu":
+            if letter in needed_faces:
+                tiles = [
+                    {"x": x * 512, "y": y * 512, "src": _cubic_url(panoid, zoom, letter, x, y)}
+                    for y in range(2)
+                    for x in range(2)
+                ]
+                faces[letter] = download_tiles_image(tiles, crop_box=[0, 0, face_size, face_size])
+            else:
+                faces[letter] = Image.new("RGB", (face_size, face_size))
+        panorama = cubemap_to_equirect(faces, face_size * 2)
 
-    zoom = 1
-    images = []
-    for item in directions:
-        tiles = [
-            {"x": x * 512, "y": y * 512, "src": _cubic_url(panoid, zoom, item, x, y)}
-            for y in range(2)
-            for x in range(2)
-        ]
-        image = download_tiles_image(tiles, crop_box=[0, 0, 1024, 1024])
-        images.append(image.resize((width, width)) if width else image)
-    return images
+    return equirect_to_perspective(panorama, yaw, pitch, width=width, height=height)
 
 
 def save_img_face(
     panoid,
-    direction,
     *,
+    yaw=0.0,
+    pitch=0.0,
     file_name=None,
     proj_type="cubic",
     width=None,
+    height=None,
     save_json=False,
 ):
-    """Download and save Naver panorama face PNG files."""
-    directions = [direction] if isinstance(direction, str) else list(direction)
-    directions = [str(item).lower().strip() for item in directions]
-    images = get_img_face(panoid, directions, proj_type=proj_type, width=width)
-    pano_info = get_pano_info(panoid) if save_json else None
-    output_paths = []
-    for item, image in zip(directions, images):
-        if file_name and len(directions) == 1:
-            output_name = file_name
-        elif file_name:
-            path = Path(file_name)
-            output_name = path.with_name(f"{path.stem}_{item}{path.suffix or '.png'}")
-        else:
-            output_name = f"{panoid}_{item}.png"
-        output_path = save_image(image, output_name)
-        if pano_info is not None:
-            save_pano_info_json(adjust_face_angle(pano_info, item), output_path)
-        output_paths.append(output_path)
-    return output_paths
+    """Download and save a Naver panorama perspective view PNG."""
+    image = get_img_face(panoid, yaw=yaw, pitch=pitch, proj_type=proj_type, width=width, height=height)
+    output_path = save_image(image, file_name or f"{panoid}.png")
+    if save_json:
+        save_pano_info_json(adjust_pano_angle(get_pano_info(panoid), yaw), output_path)
+    return output_path
 
 
 def _equirect_url(panoid, zoom, x, y):

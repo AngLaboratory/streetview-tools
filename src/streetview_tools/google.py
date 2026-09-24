@@ -1,13 +1,14 @@
 import json
-from pathlib import Path
 from urllib.parse import quote
 
 import requests
 
 from ._downloader import (
     download_tiles_image,
-    equirect_to_face,
-    adjust_face_angle,
+    equirect_to_perspective,
+    resolve_output_size,
+    select_visible_tiles,
+    adjust_pano_angle,
     save_image,
     save_pano_info_json,
     normalize_size,
@@ -18,7 +19,6 @@ from ._http import REQUEST_HEADERS
 
 _CACHE = {}
 _IMG_BLOCK_SIZE = 512
-_FACE_DIRECTIONS = "lfrbdu"
 
 
 def get_pano_info(panoid, *, spot=False):
@@ -106,18 +106,24 @@ def save_img(
 
 def get_img_face(
     panoid,
-    direction,
     *,
+    yaw=0.0,
+    pitch=0.0,
     width=None,
+    height=None,
 ):
-    """Return square Google panorama faces as PIL images.
+    """Return a perspective view of a Google Street View panorama as a PIL image.
 
-    ``direction`` may be one direction or a sequence of ``l``, ``f``, ``r``,
-    ``b``, ``d``, and ``u``. ``width`` selects the smallest face source zoom
-    at least that wide; omitted width uses Google's default zoom.
+    ``yaw`` is the left/right viewing angle in degrees (0 = forward, positive
+    = right) and ``pitch`` is the up/down viewing angle in degrees (positive
+    = up). ``width``/``height`` control the output size; the field of view is
+    derived from them automatically instead of being given directly: with
+    both omitted, Google's default zoom is used; with only ``width``, a
+    ``width``x``width`` square is returned; with both, the horizontal field
+    of view stays fixed and the vertical field of view expands to fit the
+    requested aspect ratio.
     """
     panoid = str(panoid).strip()
-    directions = _normalize_directions(direction)
     zoom_seed = get_pano_info(panoid)["others"]["zoom_seed"]
 
     zoom = select_zoom(
@@ -128,61 +134,43 @@ def get_img_face(
 
     panorama_height = zoom_seed * (2 ** zoom)
     panorama_width = panorama_height * 2
+    rows = (panorama_height + _IMG_BLOCK_SIZE - 1) // _IMG_BLOCK_SIZE
+    cols = (panorama_width + _IMG_BLOCK_SIZE - 1) // _IMG_BLOCK_SIZE
+    width, height = resolve_output_size(width, height, panorama_height)
+    needed = select_visible_tiles(rows, cols, yaw, pitch, width, height)
+
     tiles = [
         {"x": x * _IMG_BLOCK_SIZE, "y": y * _IMG_BLOCK_SIZE,
          "src": _tile_url(panoid, zoom, x, y)}
-        for y in range((panorama_height + _IMG_BLOCK_SIZE - 1) // _IMG_BLOCK_SIZE)
-        for x in range((panorama_width + _IMG_BLOCK_SIZE - 1) // _IMG_BLOCK_SIZE)
+        for y in range(rows) for x in range(cols)
+        if (y, x) in needed
     ]
-    panorama = download_tiles_image(tiles, crop_box=[0, 0, panorama_width, panorama_height])
+    panorama = download_tiles_image(
+        tiles,
+        crop_box=[0, 0, panorama_width, panorama_height],
+        canvas_size=(cols * _IMG_BLOCK_SIZE, rows * _IMG_BLOCK_SIZE),
+    )
 
-    images = [equirect_to_face(panorama, item) for item in directions]
-    if width is not None:
-        target_size = normalize_size(width)[0]
-        images = [image.resize((target_size, target_size)) for image in images]
-    return images
+    return equirect_to_perspective(panorama, yaw, pitch, width=width, height=height)
 
 
 def save_img_face(
     panoid,
-    direction,
     *,
+    yaw=0.0,
+    pitch=0.0,
     file_name=None,
     width=None,
+    height=None,
     save_json=False,
 ):
-    """Download and save square Google panorama face PNG files."""
-    directions = _normalize_directions(direction)
-    images = get_img_face(
-        panoid, directions, width=width
-    )
-    pano_info = get_pano_info(panoid) if save_json else None
-    output_paths = []
-    for item, image in zip(directions, images):
-        output_path = save_image(
-            image, _face_file_name(panoid, item, file_name, len(directions))
-        )
-        if pano_info is not None:
-            save_pano_info_json(adjust_face_angle(pano_info, item), output_path)
-        output_paths.append(output_path)
-    return output_paths
-
-
-def _normalize_directions(direction):
-    directions = [direction] if isinstance(direction, str) else list(direction)
-    directions = [str(item).lower().strip() for item in directions]
-    if not directions or any(item not in _FACE_DIRECTIONS for item in directions):
-        raise ValueError("direction must contain only: l, f, r, b, d, u")
-    return directions
-
-
-def _face_file_name(panoid, direction, file_name, count):
-    if not file_name:
-        return f"{panoid}_{direction}.png"
-    if count == 1:
-        return file_name
-    path = Path(file_name)
-    return path.with_name(f"{path.stem}_{direction}{path.suffix or '.png'}")
+    """Download and save a Google Street View perspective view PNG."""
+    panoid = str(panoid).strip()
+    image = get_img_face(panoid, yaw=yaw, pitch=pitch, width=width, height=height)
+    output_path = save_image(image, file_name or f"{panoid}.png")
+    if save_json:
+        save_pano_info_json(adjust_pano_angle(get_pano_info(panoid), yaw), output_path)
+    return output_path
 
 
 def _get_url(panoid, *, spot):
@@ -218,6 +206,7 @@ def _parse_response(text, panoid=""):
         date_str = f"{data[6][7][0]}-{data[6][7][1]:02d}-01"
 
     panorama = {
+        "service": "google",
         "id": data[1][1],
         "date": date_str,
         "lon": float(data[5][0][1][0][3]),
